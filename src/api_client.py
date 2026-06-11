@@ -1,15 +1,14 @@
 """
-TWSE API 客戶端 - 處理 HTTP 請求和回應（改進版）
+TWSE API 客戶端 - 使用正確的公開 API 端點
 """
 
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from datetime import datetime, timedelta
 import requests
 import time
+import json
 from tenacity import retry, stop_after_attempt, wait_exponential
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
 
 from src.config import config
 
@@ -21,7 +20,7 @@ class TWSSEAPIClient:
     
     def __init__(self):
         """初始化客戶端"""
-        self.base_url = config.TWSE_BASE_URL
+        self.base_url = "https://www.twse.com.tw"
         self.timeout = config.TWSE_API_TIMEOUT
         self.max_retries = config.TWSE_MAX_RETRIES
         self.session = self._create_session()
@@ -30,31 +29,17 @@ class TWSSEAPIClient:
     def _create_session(self) -> requests.Session:
         """
         建立帶有重試機制的 requests session
-        
-        Returns:
-            requests.Session: 設定好的 session 物件
         """
         session = requests.Session()
         
-        # 設定重試策略
-        retry_strategy = Retry(
-            total=self.max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"]
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        
         # 設定請求頭 - TWSE 需要特定的 User-Agent
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://www.twse.com.tw/",
+            "Origin": "https://www.twse.com.tw",
         })
         
         return session
@@ -62,131 +47,128 @@ class TWSSEAPIClient:
     def _rate_limit(self):
         """實現速率限制"""
         elapsed = time.time() - self.last_request_time
-        if elapsed < 1:  # 至少間隔 1 秒
-            time.sleep(1 - elapsed)
+        if elapsed < 0.5:  # 至少間隔 0.5 秒
+            time.sleep(0.5 - elapsed)
         self.last_request_time = time.time()
     
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
+        wait=wait_exponential(multiplier=1, min=1, max=5)
     )
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict:
         """
         發送 GET 請求
-        
-        Args:
-            endpoint: API 端點
-            params: 查詢參數
-            
-        Returns:
-            Dict: 回應資料
-            
-        Raises:
-            requests.RequestException: 請求失敗
         """
-        # 速率限制
         self._rate_limit()
         
         url = f"{self.base_url}{endpoint}"
         
-        logger.info(f"Fetching: {url}")
-        logger.debug(f"Params: {params}")
+        logger.info(f"Fetching: {url} with params: {params}")
         
         try:
             response = self.session.get(
                 url,
                 params=params,
-                timeout=self.timeout
+                timeout=self.timeout,
+                verify=True
             )
             
             logger.debug(f"Status Code: {response.status_code}")
-            logger.debug(f"Response Content Length: {len(response.content)}")
+            logger.debug(f"Response Content: {response.text[:500]}")
             
-            # 檢查 HTTP 狀態
             if response.status_code == 200:
-                # 嘗試解析 JSON
                 try:
                     data = response.json()
-                    # 檢查 TWSE 不正常的索引
-                    if isinstance(data, dict):
-                        if 'msg' in data and 'HELP_NOTFOUND' in data.get('msg', ''):
-                            logger.warning(f"Data not found: {data['msg']}")
-                            return {"data": []}
                     return data
-                except ValueError as e:
+                except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse JSON: {e}")
-                    logger.debug(f"Response text: {response.text[:200]}")
+                    logger.debug(f"Response text: {response.text}")
                     return {"data": []}
             else:
+                logger.error(f"HTTP {response.status_code}: {response.text}")
                 response.raise_for_status()
         
         except requests.RequestException as e:
             logger.error(f"Request failed: {e}")
             raise
     
-    def get_listed_companies(self) -> Dict:
+    def get_listed_companies(self) -> List[Dict]:
         """
         取得上市公司列表
-        
-        Returns:
-            Dict: 上市公司資料
+        使用 TWSE 正式 API
         """
-        # TWSE 上市公司資訊 API
-        endpoint = "exchangeReport/CORS/STOCKINFO"
+        endpoint = "/api/corp/corpsearchInfo"
         params = {
-            "query.name": "",
+            "query.cond": "and",
+            "query.type": "AND",
+            "query.pageNumber": "1",
+            "query.pageSize": "9999",
             "firstin": "true",
-            "step": "0"
+            "step": "1"
         }
         
         try:
-            return self.get(endpoint, params)
+            logger.info("Fetching listed companies from TWSE API")
+            result = self.get(endpoint, params)
+            
+            if result and "data" in result:
+                companies = []
+                for item in result.get("data", []):
+                    companies.append({
+                        "stock_code": item.get("code", ""),
+                        "company_name": item.get("name", ""),
+                        "isin_code": item.get("isin", ""),
+                        "industry_name": item.get("industryName", ""),
+                        "market_type": item.get("marketType", ""),
+                        "listing_date": item.get("listingDate", ""),
+                    })
+                logger.info(f"Retrieved {len(companies)} companies")
+                return companies
+            return []
         except Exception as e:
             logger.error(f"Failed to get listed companies: {e}")
-            return {"data": []}
+            return []
     
     def get_stock_price(self, stock_code: str, date: Optional[str] = None) -> Dict:
         """
         取得股票即時價格
-        
-        Args:
-            stock_code: 股票代號
-            date: 日期（YYYYMMDD 格式），預設為今日
-            
-        Returns:
-            Dict: 股票價格資料
+        使用 TWSE 正式 API
         """
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
+        else:
+            # 即使接收到 YYYY-MM-DD 格式，轉換為 YYYYMMDD
+            date = date.replace("-", "")
         
-        # 使用三種埯點平行試試
-        endpoints = [
-            ("exchangeReport/CORS/OHLCMONTH", {
-                "query.stockInfoItem.stockCode": stock_code,
-                "query.date": date,
-                "response.currentPageIndex": "1"
-            }),
-            ("exchangeReport/CORS/BWGAYMQ", {
-                "stockinfoid": stock_code,
-                "date": date
-            }),
-            ("exchangeReport/CORS/BWGAYMQS", {
-                "stockCode": stock_code,
-                "date": date
-            }),
-        ]
+        endpoint = "/api/data/dailystock"
+        params = {
+            "date": date,
+            "stockCode": stock_code
+        }
         
-        for endpoint, params in endpoints:
-            try:
-                result = self.get(endpoint, params)
-                if result and result.get("data"):
-                    return result
-            except Exception as e:
-                logger.warning(f"Endpoint {endpoint} failed: {e}")
-                continue
-        
-        logger.error(f"All endpoints failed for stock {stock_code}")
-        return {"data": []}
+        try:
+            logger.info(f"Fetching stock price for {stock_code} on {date}")
+            result = self.get(endpoint, params)
+            
+            if result and result.get("data"):
+                data = result["data"][0] if isinstance(result["data"], list) else result["data"]
+                
+                return {
+                    "stock_code": stock_code,
+                    "trading_date": date,
+                    "opening_price": float(data.get("open", 0)),
+                    "highest_price": float(data.get("high", 0)),
+                    "lowest_price": float(data.get("low", 0)),
+                    "closing_price": float(data.get("close", 0)),
+                    "price_change": float(data.get("change", 0)),
+                    "price_change_percent": float(data.get("changePercent", 0)),
+                    "trading_volume": int(float(data.get("volume", 0))),
+                    "trading_value": int(float(data.get("value", 0))),
+                }
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to get stock price for {stock_code}: {e}")
+            return {}
     
     def get_historical_data(
         self,
@@ -196,25 +178,19 @@ class TWSSEAPIClient:
     ) -> Dict:
         """
         取得歷史行情資料
-        
-        Args:
-            stock_code: 股票代號
-            start_date: 起始日期（YYYY-MM-DD 格式）
-            end_date: 結束日期（YYYY-MM-DD 格式）
-            
-        Returns:
-            Dict: 歷史行情資料
+        使用 TWSE 正式 API
         """
-        # 轉換日期格式
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
         
         all_data = []
         current = start
         
+        logger.info(f"Fetching historical data for {stock_code} from {start_date} to {end_date}")
+        
         while current <= end:
-            # 跳過魯半日
-            if current.weekday() == 6:  # 星期天
+            # 跳過魯半日天（星期天）
+            if current.weekday() == 6:
                 current += timedelta(days=1)
                 continue
             
@@ -222,13 +198,14 @@ class TWSSEAPIClient:
             
             try:
                 data = self.get_stock_price(stock_code, date_str)
-                if data and "data" in data and data["data"]:
-                    all_data.extend(data["data"])
+                if data:
+                    all_data.append(data)
             except Exception as e:
-                logger.warning(f"Failed to fetch data for {stock_code} on {date_str}: {e}")
+                logger.debug(f"No data for {stock_code} on {date_str}: {e}")
             
             current += timedelta(days=1)
         
+        logger.info(f"Retrieved {len(all_data)} records")
         return {
             "stock_code": stock_code,
             "start_date": start_date,
@@ -243,35 +220,42 @@ class TWSSEAPIClient:
         quarter: Optional[int] = None
     ) -> Dict:
         """
-        取得財務報表資料
-        
-        Args:
-            stock_code: 股票代號
-            year: 年份
-            quarter: 季度（1-4），None 表示年報
-            
-        Returns:
-            Dict: 財務報表資料
+        取得財务報表
+        使用 TWSE 正式 API
         """
+        endpoint = "/api/data/financialreport"
+        
         if quarter is None:
-            endpoint = "exchangeReport/CORS/FINSTATEMENTS"
             params = {
-                "query.stockCode": stock_code,
-                "query.year": year
+                "stockCode": stock_code,
+                "year": year,
+                "reportType": "annual"
             }
         else:
-            endpoint = "exchangeReport/CORS/QFINSTATEMENTS"
             params = {
-                "query.stockCode": stock_code,
-                "query.year": year,
-                "query.quarter": quarter
+                "stockCode": stock_code,
+                "year": year,
+                "quarter": quarter,
+                "reportType": "quarter"
             }
         
         try:
-            return self.get(endpoint, params)
+            logger.info(f"Fetching financial reports for {stock_code}")
+            result = self.get(endpoint, params)
+            
+            if result and result.get("data"):
+                data = result["data"]
+                return {
+                    "stock_code": stock_code,
+                    "year": year,
+                    "quarter": quarter,
+                    "report_type": "季報" if quarter else "年報",
+                    "data": data
+                }
+            return {}
         except Exception as e:
-            logger.error(f"Failed to get financial reports for {stock_code}: {e}")
-            return {"data": {}}
+            logger.error(f"Failed to get financial reports: {e}")
+            return {}
     
     def close(self):
         """關閉連線"""
