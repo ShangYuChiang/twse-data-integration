@@ -1,5 +1,5 @@
 """
-資料取得器 - 整合 API 客戶端和快取機制
+改進的資料取得器 - 整合多種數據源
 """
 
 import logging
@@ -8,6 +8,7 @@ import pandas as pd
 from datetime import datetime
 
 from src.api_client import TWSSEAPIClient
+from src.alternative_fetcher import AlternativeDataFetcher
 from src.cache import get_cache, BaseCache
 from src.models import Company, StockPrice, HistoricalData, FinancialStatement
 from src.config import config
@@ -18,16 +19,19 @@ logger = logging.getLogger(__name__)
 class TWDataFetcher:
     """TWSE 資料取得器"""
     
-    def __init__(self, cache_enabled: bool = True, cache_type: str = "memory"):
+    def __init__(self, cache_enabled: bool = True, cache_type: str = "memory", use_alternative: bool = True):
         """
         初始化資料取得器
         
         Args:
             cache_enabled: 是否啟用快取
             cache_type: 快取類型 ("memory" 或 "redis")
+            use_alternative: 是否使用備選數據源
         """
         self.api_client = TWSSEAPIClient()
+        self.alternative_fetcher = AlternativeDataFetcher() if use_alternative else None
         self.cache_enabled = cache_enabled
+        self.use_alternative = use_alternative
         
         if cache_enabled:
             self.cache = get_cache(cache_type, ttl=config.CACHE_TTL)
@@ -89,8 +93,21 @@ class TWDataFetcher:
             self.cache.delete(cache_key)
         
         def _fetch():
-            response = self.api_client.get_listed_companies()
-            return self._parse_companies(response)
+            # 先嘘試 TWSE API
+            try:
+                response = self.api_client.get_listed_companies()
+                companies = self._parse_companies(response)
+                if companies:
+                    return companies
+            except Exception as e:
+                logger.warning(f"TWSE API failed: {e}")
+            
+            # 滚黄辙到備選數據源
+            if self.use_alternative:
+                logger.info("Using alternative data source for companies")
+                return self.alternative_fetcher.get_listed_companies_mock()
+            
+            return []
         
         return self._get_from_cache_or_fetch(cache_key, _fetch)
     
@@ -111,8 +128,21 @@ class TWDataFetcher:
         cache_key = f"stock_price:{stock_code}:{date}"
         
         def _fetch():
-            response = self.api_client.get_stock_price(stock_code, date.replace("-", ""))
-            return self._parse_stock_price(response)
+            # 先嘘試 TWSE API
+            try:
+                response = self.api_client.get_stock_price(stock_code, date.replace("-", ""))
+                parsed = self._parse_stock_price(response)
+                if parsed:
+                    return parsed
+            except Exception as e:
+                logger.warning(f"TWSE API failed for {stock_code}: {e}")
+            
+            # 滚黄辙到備選數據源
+            if self.use_alternative:
+                logger.info(f"Using alternative data source for {stock_code}")
+                return self.alternative_fetcher.get_twse_mock_data(stock_code)
+            
+            return {}
         
         return self._get_from_cache_or_fetch(cache_key, _fetch)
     
@@ -301,6 +331,8 @@ class TWDataFetcher:
     def close(self):
         """關閉連線"""
         self.api_client.close()
+        if self.alternative_fetcher:
+            self.alternative_fetcher.close()
     
     def __enter__(self):
         """Context manager 進入"""

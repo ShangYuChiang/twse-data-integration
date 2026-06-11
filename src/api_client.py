@@ -106,11 +106,17 @@ class TWSSEAPIClient:
             if response.status_code == 200:
                 # 嘗試解析 JSON
                 try:
-                    return response.json()
+                    data = response.json()
+                    # 檢查 TWSE 不正常的索引
+                    if isinstance(data, dict):
+                        if 'msg' in data and 'HELP_NOTFOUND' in data.get('msg', ''):
+                            logger.warning(f"Data not found: {data['msg']}")
+                            return {"data": []}
+                    return data
                 except ValueError as e:
                     logger.error(f"Failed to parse JSON: {e}")
                     logger.debug(f"Response text: {response.text[:200]}")
-                    return {"error": "Invalid JSON response", "data": []}
+                    return {"data": []}
             else:
                 response.raise_for_status()
         
@@ -153,46 +159,34 @@ class TWSSEAPIClient:
         if date is None:
             date = datetime.now().strftime("%Y%m%d")
         
-        # 使用 OHLCMONTH 端點
-        endpoint = "exchangeReport/CORS/OHLCMONTH"
-        params = {
-            "query.stockInfoItem.stockCode": stock_code,
-            "query.date": date,
-            "response.currentPageIndex": "1"
-        }
+        # 使用三種埯點平行試試
+        endpoints = [
+            ("exchangeReport/CORS/OHLCMONTH", {
+                "query.stockInfoItem.stockCode": stock_code,
+                "query.date": date,
+                "response.currentPageIndex": "1"
+            }),
+            ("exchangeReport/CORS/BWGAYMQ", {
+                "stockinfoid": stock_code,
+                "date": date
+            }),
+            ("exchangeReport/CORS/BWGAYMQS", {
+                "stockCode": stock_code,
+                "date": date
+            }),
+        ]
         
-        try:
-            return self.get(endpoint, params)
-        except Exception as e:
-            logger.error(f"Failed to get stock price for {stock_code}: {e}")
-            return {"data": []}
-    
-    def get_daily_quote(self, stock_code: str, date: Optional[str] = None) -> Dict:
-        """
-        取得每日行情（備選方案）
+        for endpoint, params in endpoints:
+            try:
+                result = self.get(endpoint, params)
+                if result and result.get("data"):
+                    return result
+            except Exception as e:
+                logger.warning(f"Endpoint {endpoint} failed: {e}")
+                continue
         
-        Args:
-            stock_code: 股票代號
-            date: 日期（YYYYMMDD 格式），預設為今日
-            
-        Returns:
-            Dict: 股票價格資料
-        """
-        if date is None:
-            date = datetime.now().strftime("%Y%m%d")
-        
-        # 使用 BWGAYMQ 端點（每日行情）
-        endpoint = "exchangeReport/CORS/BWGAYMQ"
-        params = {
-            "stockinfoid": stock_code,
-            "date": date
-        }
-        
-        try:
-            return self.get(endpoint, params)
-        except Exception as e:
-            logger.error(f"Failed to get daily quote for {stock_code}: {e}")
-            return {"data": []}
+        logger.error(f"All endpoints failed for stock {stock_code}")
+        return {"data": []}
     
     def get_historical_data(
         self,
@@ -219,11 +213,16 @@ class TWSSEAPIClient:
         current = start
         
         while current <= end:
+            # 跳過魯半日
+            if current.weekday() == 6:  # 星期天
+                current += timedelta(days=1)
+                continue
+            
             date_str = current.strftime("%Y%m%d")
             
             try:
                 data = self.get_stock_price(stock_code, date_str)
-                if data and "data" in data:
+                if data and "data" in data and data["data"]:
                     all_data.extend(data["data"])
             except Exception as e:
                 logger.warning(f"Failed to fetch data for {stock_code} on {date_str}: {e}")
